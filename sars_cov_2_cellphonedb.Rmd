@@ -1,0 +1,31 @@
+---
+title: "sars_cov_2_cellphonedb"
+author: "Dien Nguyen"
+date: '2023-04-11'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(readr)
+library(SeuratDisk)
+```
+
+```{r}
+alive_integrated <- readRDS("./alive_integrated.rds")
+metadata<- alive_integrated$celltype
+metadata<-as.data.frame(metadata)
+#Turn index into column
+metadata <- cbind(rownames(metadata), metadata)
+rownames(metadata) <- 1:nrow(metadata)
+colnames(metadata)<- c("barcode_sample", "cell_type")
+write_tsv(metadata, "~/metadata.tsv")
+
+#Convert to H5Seurat
+SaveH5Seurat(alive_integrated, filename = "~/alive_integrated.h5Seurat")
+Convert("~/alive_integrated.h5Seurat", dest = "h5ad")
+```
+
+

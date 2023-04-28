@@ -1,0 +1,369 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(readr)
+library(ggplot2)
+```
+
+```{r}
+data.3dpi <- Read10X(data.dir = "~/projects/def-apwong/dienng/run_count_Cleaned_168_3dpi/outs/filtered_feature_bc_matrix")
+data.6dpi <- Read10X(data.dir = "~/projects/def-apwong/dienng/run_count_Cleaned_168_6dpi/outs/filtered_feature_bc_matrix")
+data.control <- Read10X(data.dir = "~/projects/def-apwong/dienng/run_count_Cleaned_168_control/outs/filtered_feature_bc_matrix")
+
+cov.3dpi <- CreateSeuratObject(counts = data.3dpi, project = "SARS_CoV_2_3dpi")
+cov.6dpi <- CreateSeuratObject(counts = data.6dpi, project = "SARS_CoV_2_6dpi")
+cov.control <- CreateSeuratObject(counts = data.control, project = "SARS_CoV_2_control")
+
+all_samples <- c(cov.3dpi, cov.6dpi, cov.control)
+```
+
+```{r}
+for (i in 1:length(all_samples)) {
+  all_samples[[i]][["percent.mt"]] <- PercentageFeatureSet(all_samples[[i]], pattern = "^MT-")
+}
+```
+
+```{r}
+dpi3_percentmt_hist = hist(all_samples[[1]]@meta.data$percent.mt, breaks = 100, xlab = "percent.mt", main = "3dpi")
+dpi6_percentmt_hist = hist(all_samples[[2]]@meta.data$percent.mt, breaks = 100, xlab = "percent.mt", main = "6dpi")
+control_percentmt_hist = hist(all_samples[[3]]@meta.data$percent.mt, breaks = 100, xlab = "percent.mt", main = "control")
+
+
+# 15% for mitochondrial RNA as threshold for 3 and 6dpi, 12% for control
+
+# for 3dpi:
+all_samples[[1]]$condition <- dplyr::case_when(all_samples[[1]]$percent.mt < 15 ~ "Alive", TRUE ~  "Dead")
+all_samples[[2]]$condition <- dplyr::case_when(all_samples[[2]]$percent.mt < 15 ~ "Alive", TRUE ~  "Dead")
+all_samples[[3]]$condition <- dplyr::case_when(all_samples[[3]]$percent.mt < 12 ~ "Alive", TRUE ~  "Dead")
+```
+
+## Proportion graph for dead cells
+```{r}
+pdf("./cell_condition_proportion_graph.pdf", width = 7)
+for (i in (1:length(all_samples))) {
+  captured_freq <- all_samples[[i]]@meta.data %>%
+  group_by(condition) %>%
+  summarise(count=n()) %>%
+  mutate(relative_freq = count/sum(count)) %>%
+  mutate(data_set = "Dead")
+  
+  print(ggplot(captured_freq, aes(x = 1, y = relative_freq, fill = condition)) + 
+  geom_col() +
+  xlab("Cells"))
+}
+
+dev.off()
+```
+
+
+```{r}
+dead <- cbind(prop.table(table(all_samples[[1]]@meta.data$condition))["Dead"] * 100, prop.table(table(all_samples[[2]]@meta.data$condition))["Dead"] * 100, prop.table(table(all_samples[[3]]@meta.data$condition))["Dead"] * 100)
+
+dead <- as.data.frame(dead)
+
+# Create a matrix of data
+data <- matrix(dead[1,], nrow = 1, dimnames = list("Dead", c("3dpi", "6dpi", "Control")))
+
+# Create a barplot
+barplot(data, main = "Percentage of dead cells", xlab = "Sample", ylab = "Percentage", col = rainbow(ncol(data)), ylim = c(0, 2.5))
+
+ggsave("./percentage_dead_cells.pdf")
+```
+# Subset the dead cells and alive cells
+```{r}
+alive.3dpi <- subset(all_samples[[1]], subset = nFeature_RNA > 200 & percent.mt < 15)
+dead.3dpi <- subset(all_samples[[1]], subset = nFeature_RNA <= 200 | percent.mt >= 15)
+
+alive.6dpi <- subset(all_samples[[2]], subset = nFeature_RNA > 200 & percent.mt < 15)
+dead.6dpi <- subset(all_samples[[2]], subset = nFeature_RNA <= 200 | percent.mt >= 15)
+
+alive.control <- subset(all_samples[[3]], subset = nFeature_RNA > 200 & percent.mt < 12)
+dead.control <- subset(all_samples[[3]], subset = nFeature_RNA <= 200 | percent.mt >= 12)
+
+alive.list <- c(alive.3dpi, alive.6dpi, alive.control)
+dead.list <- c(dead.3dpi, dead.6dpi, dead.control)
+```
+
+
+## Normalize and identify variable features for each dataset independently
+```{r}
+alive.list <- lapply(X = alive.list, FUN = function(x) {
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+})
+
+dead.list <- lapply(X = dead.list, FUN = function(x) {
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+})
+```
+## Select features and run PCA
+select features that are repeatedly variable across datasets for integration run PCA on each dataset using these features
+
+```{r}
+alive.features <- SelectIntegrationFeatures(object.list = alive.list)
+alive.list <- lapply(X = alive.list, FUN = function(x) {
+  x <- ScaleData(x, features = alive.features, verbose = FALSE)
+  x <- RunPCA(x, features = alive.features, verbose = FALSE)
+})
+
+dead.features <- SelectIntegrationFeatures(object.list = dead.list)
+dead.list <- lapply(X = dead.list, FUN = function(x) {
+  x <- ScaleData(x, features = dead.features, verbose = FALSE)
+  x <- RunPCA(x, features = dead.features, verbose = FALSE, npcs = 10, svd.method = "svd")
+})
+
+pdf("./alive_features.pdf")
+lapply(X = alive.list, FUN = function(x) {
+  VizDimLoadings(x, dims = 1:2, reduction = "pca")
+})
+dev.off()
+
+pdf("./dead_features.pdf")
+lapply(X = dead.list, FUN = function(x) {
+  VizDimLoadings(x, dims = 1:2, reduction = "pca")
+})
+dev.off()
+```
+
+## Integration
+```{r}
+alive.list.anchors <- FindIntegrationAnchors(object.list = alive.list, anchor.features = alive.features)
+alive.list.integrated <- IntegrateData(anchorset = alive.list.anchors)
+DefaultAssay(alive.list.integrated) <- "integrated"
+
+dead.list.anchors <- FindIntegrationAnchors(object.list = dead.list, anchor.features = dead.features, dims = 10)
+dead.list.integrated <- IntegrateData(anchorset = dead.list.anchors)
+DefaultAssay(dead.list.integrated) <- "integrated"
+
+```
+
+
+## Standard workflow
+```{r}
+alive.list.integrated <- ScaleData(alive.list.integrated, verbose = FALSE)
+alive.list.integrated <- RunPCA(alive.list.integrated, npcs = 30, verbose = FALSE)
+alive.list.integrated <- RunUMAP(alive.list.integrated, reduction = "pca", dims = 1:30)
+alive.list.integrated <- FindNeighbors(alive.list.integrated, reduction = "pca", dims = 1:30)
+alive.list.integrated <- FindClusters(alive.list.integrated, resolution = 0.2)
+```
+## Visualize
+```{r}
+pdf(file = "./alive_umap.pdf")
+
+DimPlot(alive.list.integrated, reduction = "umap", group.by = "orig.ident")
+
+
+dev.off()
+```
+
+## Visualization with different clustering resolutions
+```{r}
+destination = "./alive_different_cluster_resolutions.pdf"
+pdf(file = destination)
+
+alive.list.integrated <- FindClusters(alive.list.integrated, resolution = 0.4)
+DimPlot(alive.list.integrated, reduction = "umap", label = TRUE, repel = TRUE)
+
+alive.list.integrated <- FindClusters(alive.list.integrated, resolution = 0.3)
+DimPlot(alive.list.integrated, reduction = "umap", label = TRUE, repel = TRUE)
+
+alive.list.integrated <- FindClusters(alive.list.integrated, resolution = 0.2)
+DimPlot(alive.list.integrated, reduction = "umap", label = TRUE, repel = TRUE)
+
+dev.off()
+```
+
+## Choose clustering resolution
+```{r}
+alive.list.integrated <- FindClusters(alive.list.integrated, resolution = 0.3)
+```
+
+
+## Cell-cycle scoring
+```{r}
+destination = "./cell_cycle_scoring.pdf"
+pdf(file = destination)
+# A list of cell cycle markers, from Tirosh et al, 2015, is loaded with Seurat.  We can
+# segregate this list into markers of G2/M phase and markers of S phase
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+alive.ccs <- CellCycleScoring(alive.list.integrated, g2m.features = g2m.genes, s.features = s.genes)
+
+alive.ccs <- RunPCA(alive.ccs, features = c(s.genes, g2m.genes))
+
+DimPlot(alive.ccs, reduction = "pca", group.by = "Phase") + ggtitle("PCA based on expression of cell cycle markers")
+DimPlot(alive.ccs, reduction = "umap", group.by = "Phase")
+DimPlot(alive.ccs, reduction = "umap", group.by = "orig.ident")
+
+dev.off()
+```
+
+## Identification of cell types
+```{r}
+DefaultAssay(alive.list.integrated) <- "RNA"
+alive.markers <- FindAllMarkers(alive.list.integrated, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+write.csv(alive.markers, "./alive_markers_res_0.3.csv")
+
+alive.markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 2, order_by = avg_log2FC)
+
+alive.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+
+VlnPlot(alive.list.integrated, features = c("ACE2", "TMPRSS2"), group.by = "orig.ident")
+
+VlnPlot(cf009.without.ge.integration.ccr, features = "percent.mt")
+FeaturePlot(alive.list.integrated, features = c("ACE2", "TMPRSS2"))
+```
+## Matching genes with MasterList
+```{r}
+library(readxl)
+library(tidyverse)
+library(readr)
+```
+
+## Load MasterList and sample list
+```{r}
+Master_List_scRNAseq_markersDec7 <- read_excel("./Master List - scRNAseq markersDec7.xlsx", 
+    sheet = "GENES")
+MasterList <- as.data.frame(Master_List_scRNAseq_markersDec7)
+
+alive.markers <- read_csv("./alive_markers_res_0.3.csv")
+
+
+alive.markers <- as.data.frame(alive.markers)
+```
+
+
+## Reformat data frame
+```{r}
+colnames(MasterList) <- MasterList[2,]
+MasterList <- MasterList[4:nrow(MasterList),]
+rownames(MasterList) <- MasterList[,1]
+```
+
+## Function to match genes from sample list, and subset genes that are mentioned in Masterlist generated from scRNAseq literature search. 
+```{r}
+checklist <- function(sample, Masterlist) {
+  newtable <- data.frame()
+  for (i in (1:nrow(sample))){
+    new_list <- data.frame()
+    if (sample[i,"gene"] %in% Masterlist[,"Genes"]){
+      new_list[1,1:5] <- sample[i,c("avg_log2FC","cluster","gene", "pct.1", "pct.2")]
+      new_list<- cbind(new_list, Masterlist[as.character(sample[i,"gene"]),])
+    }
+    newtable<- rbind(newtable, new_list)
+  }
+  return(newtable)
+}
+```
+
+```{r}
+matching.genes <- checklist(alive.markers, MasterList)
+write_csv(matching.genes, "./alive_matching_genes_res_0.3.csv")
+```
+
+## Renaming and include annotation
+```{r}
+new.cluster.ids <- c("Basal 1", "Secretory", "Inflammatory intermediate", "CEACAM5+ epithelia",  "Stromal", "ID2+ distal lung epithelia", "Basal 2", "HOPX+ alveolar", "Inflammatory epithelia", "Ciliated")
+names(new.cluster.ids) <- levels(alive.list.integrated)
+alive.list.integrated <- RenameIdents(alive.list.integrated, new.cluster.ids)
+DimPlot(alive.list.integrated, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+ggsave("./alive_integrated_labeled_UMAP.pdf")
+```
+## DotPlot 
+```{r}
+# "CYP4B1", "SCGB1A1", "SFTPC", "ACE2", "TMPRSS2"
+DotPlot(alive.list.integrated, cols = c("#ffffa1", "blue"), features = c("ID2", "COL1A1", "TP63", "KRT5", "CEACAM5","CEACAM6", "FOXJ1", "SERPINA1", "TNF", "PTGES", "MUC20", "CLIC5", "HOPX"), cluster.idents = TRUE) + theme(axis.text.x = element_text(angle = 90)) + 
+  scale_size(range = c(1.5, 10)) + 
+  labs(x = "Gene", y = "Cluster", title = "Comparison of gene expression across different clusters")
+```
+
+## Subset cluster 3 (CEACAM5+epithelia)ve.
+```{r}
+cluster3 <- subset(alive.list.integrated, subset = seurat_clusters == "3")
+DefaultAssay(cluster3) <- "integrated"
+cluster3 <- FindNeighbors(cluster3, reduction = "pca", dims = 1:30)
+#cluster3 <- RunPCA(cluster3)
+cluster3 <- FindClusters(cluster3, resolution = 0.2)
+cluster3 <- RunUMAP(cluster3, reduction = "pca", dims = 1:30)
+pdf("./cluster3_subclusters.pdf")
+DimPlot(cluster3)
+cluster3 <- FindClusters(cluster3, resolution = 0.3)
+DimPlot(cluster3)
+cluster3 <- FindClusters(cluster3, resolution = 0.4)
+DimPlot(cluster3)
+dev.off()
+```
+## Identify cell types of cluster 3
+```{r}
+DefaultAssay(cluster3) <- "RNA"
+cluster3.markers <- FindAllMarkers(cluster3, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+write.csv(cluster3.markers, "./cluster3_markers_res_0.3.csv")
+cluster3.markers <- as.data.frame(cluster3.markers)
+
+matching.genes <- checklist(cluster3.markers, MasterList)
+write_csv(matching.genes, "./cluster3_matching_genes_res_0.3.csv")
+
+DotPlot(cluster3, features = c("CEACAM5", "KRT5", "KRT17", "S100A8", "S100A9", "MUC16")) +  scale_size(range = c(5, 10))
+ggsave("./cluster_3_dotplot.pdf")
+```
+
+##Run clustree
+```{r}
+alive.list.integrated <- FindNeighbors(alive.list.integrated, reduction = "pca", dims = 1:30)
+DefaultAssay(alive.list.integrated) <- "integrated"
+alive.list.integrated <- FindClusters(alive.list.integrated, resolution = 1)
+alive.list.integrated <- FindClusters(alive.list.integrated, resolution = 0.7)
+alive.list.integrated <- FindClusters(alive.list.integrated, resolution = 0.5)
+alive.list.integrated <- FindClusters(alive.list.integrated, resolution = 0.1)
+
+library(clustree)
+clustree(alive.list.integrated)
+ggsave("./clustress.pdf", height = 10, width = 10)
+```
+## Sort the idents alphabatically in DimPlot, so the colour will align with the bar graph,
+```{r}
+library(RColorBrewer)
+pdf("./alive_integrated_proportion_graph.pdf")
+
+pt <- table(Idents(alive.list.integrated), alive.list.integrated$orig.ident)
+pt <- as.data.frame(pt)
+pt$Var1 <- as.character(pt$Var1)
+  ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_bw(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+   xlab("Sample") +
+  ylab("Proportion") +
+  scale_fill_manual(values = c(brewer.pal("Set1", n=9), brewer.pal("Dark2", n=8), "Blue 2")) +
+  theme(legend.title = element_blank(), axis.text.x = element_text(angle = 90, vjust = 0.5))
+  
+dev.off()
+
+```
+## Create metadata files for CellphoneDB
+```{r}
+alive_integrated <- readRDS("./alive_integrated.rds")
+alive_integrated[["cell_type"]] <- Idents(alive_integrated)
+metadata<- alive_integrated$cell_type
+metadata<-as.data.frame(metadata)
+#Turn index into column
+metadata <- cbind(rownames(metadata), metadata)
+rownames(metadata) <- 1:nrow(metadata)
+colnames(metadata)<- c("barcode_sample", "cell_type")
+write_tsv(metadata, "~/metadata.tsv")
+```
+
+
